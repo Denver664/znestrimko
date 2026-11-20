@@ -25,7 +25,7 @@ DB_PATH = BASE_DIR / "bot.sqlite3"
 API_URL = "https://be-svitlo.oe.if.ua/schedule-by-queue?queue={}"
 VALID_QUEUES = {f"{number}.{group}" for number in range(1, 7) for group in range(1, 3)}
 POLL_INTERVAL_SECONDS = 60
-REMINDER_MINUTES = 15
+REMINDER_MINUTES = 10
 TIMEOUT_SECONDS = 30
 KYIV = ZoneInfo("Europe/Kyiv")
 
@@ -122,6 +122,7 @@ def format_schedule(queue: str, payload: dict[str, Any], title: str = "Граф�
         f"🚦 Черга: <b>{queue}</b>",
         f"📌 Статус: <b>{status}</b>",
         f"⏰ Час: <b>{interval_text}</b>",
+        f"📊 Загалом без світла за графіком: <b>{human_duration(scheduled_blackout_seconds(intervals))}</b>",
     ]
     created = payload.get("createdAt")
     approved = payload.get("scheduleApprovedSince")
@@ -186,7 +187,7 @@ async def send_upcoming_reminders(bot: Bot, queue: str, payload: dict[str, Any])
         except (ValueError, TypeError):
             continue
         remaining = (start - now).total_seconds()
-        # A one-minute polling loop with a 15–16 minute window reliably catches each event once.
+        # A one-minute polling loop with a 10–11 minute window catches each event once.
         if not (REMINDER_MINUTES * 60 <= remaining < (REMINDER_MINUTES + 1) * 60):
             continue
         for chat_id in subscribed_chats(queue):
@@ -200,7 +201,7 @@ async def send_upcoming_reminders(bot: Bot, queue: str, payload: dict[str, Any])
             try:
                 await bot.send_message(
                     chat_id,
-                    f"🔔 <b>Нагадування</b>\nЧерга {queue}: за 15 хвилин вимкнуть світло.\nПеріод: <b>{hours}</b>",
+                    f"🔔 <b>Нагадування</b>\nЧерга {queue}: за 10 хвилин вимкнуть світло.\nПеріод: <b>{hours}</b>",
                 )
                 claim_reminder(chat_id, queue, event_date, hours)
             except Exception as exc:
@@ -462,7 +463,7 @@ async def main() -> None:
         if not queue:
             return
         add_subscription(message.chat.id, queue)
-        await message.answer(f"✅ Підписку на чергу <b>{queue}</b> увімкнено.\n🔄 Перевіряю оновлення кожні 10 хвилин.")
+        await message.answer(f"✅ Підписку на чергу <b>{queue}</b> увімкнено.\n🔄 Перевіряю оновлення щохвилини.")
         async with aiohttp.ClientSession() as session:
             await send_schedule(message, queue, session, "Поточний графік")
 
@@ -586,7 +587,7 @@ async def main() -> None:
         if action == "subscribe":
             add_subscription(message.chat.id, queue)
             await message.answer(
-                f"✅ Підписку на чергу <b>{queue}</b> увімкнено.\n🔄 Перевіряю оновлення кожні 10 хвилин.",
+                f"✅ Підписку на чергу <b>{queue}</b> увімкнено.\n🔄 Перевіряю оновлення щохвилини.",
                 reply_markup=main_keyboard(),
             )
             async with aiohttp.ClientSession() as session:
