@@ -21,7 +21,10 @@ except ImportError:  # pragma: no cover
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "bot.sqlite3"
+if load_dotenv:
+    load_dotenv(BASE_DIR / ".env")
+
+DB_PATH = Path(os.getenv("BOT_DB_PATH", BASE_DIR / "bot.sqlite3"))
 API_URL = "https://be-svitlo.oe.if.ua/schedule-by-queue?queue={}"
 VALID_QUEUES = {f"{number}.{group}" for number in range(1, 7) for group in range(1, 3)}
 POLL_INTERVAL_SECONDS = 60
@@ -29,16 +32,20 @@ REMINDER_MINUTES = 10
 TIMEOUT_SECONDS = 30
 KYIV = ZoneInfo("Europe/Kyiv")
 
-if load_dotenv:
-    load_dotenv(BASE_DIR / ".env")
+FORCE_REFRESH_REQUESTS: asyncio.Queue[str] = asyncio.Queue()
+FORCE_REFRESH_EVENT = asyncio.Event()
+BOT_RUNNING = False
+LAST_CHECK_AT: str | None = None
+LAST_SUCCESS_AT: str | None = None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def connect_db():
     import sqlite3
 
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute(
@@ -204,6 +211,7 @@ async def send_upcoming_reminders(bot: Bot, queue: str, payload: dict[str, Any])
                     f"🔔 <b>Нагадування</b>\nЧерга {queue}: за 10 хвилин вимкнуть світло.\nПеріод: <b>{hours}</b>",
                 )
                 claim_reminder(chat_id, queue, event_date, hours)
+                logger.info("Надіслано нагадування: chat_id=%s queue=%s date=%s period=%s", chat_id, queue, event_date, hours)
             except Exception as exc:
                 logger.warning("Не вдалося надіслати нагадування chat_id=%s: %s", chat_id, exc)
 
@@ -312,12 +320,16 @@ def save_and_check_changed(queue: str, payload: dict[str, Any]) -> bool:
             (queue, event_date, serialized, now),
         )
         if old is None:
+            logger.info("Графік додано до локального кешу: queue=%s date=%s", queue, event_date)
             return False
         try:
             previous_payload = json.loads(old["payload"])
         except (TypeError, json.JSONDecodeError):
             return False
-        return schedule_signature(previous_payload, queue) != schedule_signature(payload, queue)
+        changed = schedule_signature(previous_payload, queue) != schedule_signature(payload, queue)
+        if changed:
+            logger.info("Змінився графік: queue=%s date=%s", queue, event_date)
+        return changed
 
 
 def schedule_signature(payload: dict[str, Any], queue: str) -> list[tuple[str, str, str, int]]:
@@ -434,6 +446,7 @@ async def send_tomorrow_schedule(message: Message, queue: str, session: aiohttp.
 
 
 async def main() -> None:
+    global BOT_RUNNING, LAST_CHECK_AT, LAST_SUCCESS_AT
     token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задано BOT_TOKEN у файлі .env")
@@ -442,6 +455,8 @@ async def main() -> None:
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
     pending_action: dict[int, str] = {}
+    BOT_RUNNING = True
+    logger.info("Telegram-бот запускається; черг моніторингу: %s", len(VALID_QUEUES))
 
     @dispatcher.message(CommandStart())
     async def start(message: Message) -> None:
@@ -463,6 +478,7 @@ async def main() -> None:
         if not queue:
             return
         add_subscription(message.chat.id, queue)
+        logger.info("Нова підписка: chat_id=%s queue=%s", message.chat.id, queue)
         await message.answer(f"✅ Підписку на чергу <b>{queue}</b> увімкнено.\n🔄 Перевіряю оновлення щохвилини.")
         async with aiohttp.ClientSession() as session:
             await send_schedule(message, queue, session, "Поточний графік")
@@ -478,6 +494,7 @@ async def main() -> None:
         if not queue:
             return
         remove_subscription(message.chat.id, queue)
+        logger.info("Підписку видалено: chat_id=%s queue=%s", message.chat.id, queue)
         await message.answer(f"🔕 Підписку на чергу <b>{queue}</b> вимкнено.")
 
     @dispatcher.message(F.text == "➖ Відписатися")
@@ -586,6 +603,7 @@ async def main() -> None:
         pending_action.pop(message.chat.id, None)
         if action == "subscribe":
             add_subscription(message.chat.id, queue)
+            logger.info("Нова підписка через меню: chat_id=%s queue=%s", message.chat.id, queue)
             await message.answer(
                 f"✅ Підписку на чергу <b>{queue}</b> увімкнено.\n🔄 Перевіряю оновлення щохвилини.",
                 reply_markup=main_keyboard(),
@@ -594,6 +612,7 @@ async def main() -> None:
                 await send_schedule(message, queue, session, "Поточний графік")
         elif action == "unsubscribe":
             remove_subscription(message.chat.id, queue)
+            logger.info("Підписку видалено через меню: chat_id=%s queue=%s", message.chat.id, queue)
             await message.answer(f"🔕 Підписку на чергу <b>{queue}</b> вимкнено.", reply_markup=main_keyboard())
         elif action == "tomorrow":
             async with aiohttp.ClientSession() as session:
@@ -606,26 +625,62 @@ async def main() -> None:
                 await send_today_schedule(message, queue, session)
 
     async def monitor() -> None:
+        global LAST_CHECK_AT, LAST_SUCCESS_AT
+        logger.info("Монітор графіків запущено з інтервалом %s сек.", POLL_INTERVAL_SECONDS)
         async with aiohttp.ClientSession() as session:
             while True:
-                queues = {queue for chat_id in all_chats() for queue in queue_subscriptions(chat_id)}
+                forced_queues: set[str] = set()
+                while not FORCE_REFRESH_REQUESTS.empty():
+                    requested = FORCE_REFRESH_REQUESTS.get_nowait()
+                    forced_queues.update(VALID_QUEUES if requested == "*" else {requested})
+                FORCE_REFRESH_EVENT.clear()
+                queues = {queue for chat_id in all_chats() for queue in queue_subscriptions(chat_id)} | forced_queues
                 for queue in queues:
-                    today_payload = await fetch_today_schedule(session, queue)
-                    if today_payload:
-                        await send_upcoming_reminders(bot, queue, today_payload)
-                    tomorrow_payload = await fetch_tomorrow_schedule(session, queue)
-                    for payload, title in (
-                        (today_payload, "Графік на сьогодні оновлено"),
-                        (tomorrow_payload, "Графік на завтра оновлено"),
-                    ):
-                        if payload and save_and_check_changed(queue, payload):
-                            text = format_schedule(queue, payload, title)
-                            for chat_id in subscribed_chats(queue):
-                                try:
-                                    await bot.send_message(chat_id, text)
-                                except Exception as exc:
-                                    logger.warning("Не вдалося надіслати оновлення chat_id=%s: %s", chat_id, exc)
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    LAST_CHECK_AT = datetime.now(KYIV).isoformat(timespec="seconds")
+                    forced = queue in forced_queues
+                    if forced:
+                        logger.info("Починаю примусове оновлення графіка: queue=%s", queue)
+                    try:
+                        today_payload = await fetch_today_schedule(session, queue)
+                        if today_payload:
+                            await send_upcoming_reminders(bot, queue, today_payload)
+                        tomorrow_payload = await fetch_tomorrow_schedule(session, queue)
+                        if today_payload or tomorrow_payload:
+                            LAST_SUCCESS_AT = datetime.now(KYIV).isoformat(timespec="seconds")
+                        if not today_payload and not tomorrow_payload:
+                            logger.warning("Графік недоступний: queue=%s forced=%s", queue, forced)
+                            continue
+                        for payload, title in (
+                            (today_payload, "Графік на сьогодні оновлено"),
+                            (tomorrow_payload, "Графік на завтра оновлено"),
+                        ):
+                            if not payload:
+                                continue
+                            changed = save_and_check_changed(queue, payload)
+                            if forced or changed:
+                                if forced:
+                                    title = "Графік примусово оновлено"
+                                text = format_schedule(queue, payload, title)
+                                recipients = subscribed_chats(queue)
+                                sent = 0
+                                for chat_id in recipients:
+                                    try:
+                                        await bot.send_message(chat_id, text)
+                                        sent += 1
+                                    except Exception:
+                                        logger.exception("Помилка розсилки графіка: chat_id=%s queue=%s", chat_id, queue)
+                                logger.info(
+                                    "Оновлення графіка завершено: queue=%s date=%s forced=%s recipients=%s sent=%s changed=%s",
+                                    queue, payload.get("eventDate"), forced, len(recipients), sent, changed,
+                                )
+                        if forced:
+                            logger.info("Примусове оновлення завершено: queue=%s", queue)
+                    except Exception:
+                        logger.exception("Помилка циклу графіка: queue=%s forced=%s", queue, forced)
+                try:
+                    await asyncio.wait_for(FORCE_REFRESH_EVENT.wait(), timeout=POLL_INTERVAL_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
 
     def all_chats() -> list[int]:
         with connect_db() as db:
@@ -636,8 +691,11 @@ async def main() -> None:
     try:
         await dispatcher.start_polling(bot)
     finally:
+        BOT_RUNNING = False
         monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
         await bot.session.close()
+        logger.info("Telegram-бот зупинений")
 
 
 if __name__ == "__main__":
