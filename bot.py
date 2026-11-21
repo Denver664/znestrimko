@@ -206,29 +206,67 @@ def today_schedule_status(items: list[dict[str, Any]], event_date: str) -> tuple
 def format_schedule(queue: str, payload: dict[str, Any], title: str = "Графік") -> str:
     event_date = payload.get("eventDate", "невідома дата")
     intervals = payload.get("queues", {}).get(queue, [])
-    status, interval_text = today_schedule_status(intervals, event_date)
+    status, _ = today_schedule_status(intervals, event_date)
     lines = [
         f"⚡ <b>{title}</b>",
         "",
-        "<blockquote>",
         f"🗓 Дата: <b>{html.escape(str(event_date))}</b>",
         f"🚦 Черга: <b>{html.escape(queue)}</b>",
         f"📌 Статус: <b>{html.escape(status)}</b>",
-        f"⏰ Час: <b>{html.escape(interval_text)}</b>",
-        f"📊 Загалом без світла за графіком: <b>{human_duration(scheduled_blackout_seconds(intervals))}</b>",
-        "</blockquote>",
     ]
+    outage_quotes = format_outage_quotes(intervals, event_date)
+    if outage_quotes:
+        lines.extend(["", *outage_quotes])
+    else:
+        lines.extend(["", "🟢 Запланованих відключень немає"])
+    lines.extend([
+        "",
+        f"📊 Загалом без світла за графіком: <b>{human_duration(scheduled_blackout_seconds(intervals))}</b>",
+    ])
     created = payload.get("createdAt")
     approved = payload.get("scheduleApprovedSince")
     if created:
-        lines.extend(["", "<blockquote expandable>", f"🔄 Оновлено: {html.escape(str(created))}"])
+        lines.extend(["", f"🔄 Оновлено: {html.escape(str(created))}"])
     if approved:
-        if not created:
-            lines.extend(["", "<blockquote expandable>"])
         lines.append(f"✅ Затверджено з: {html.escape(str(approved))}")
-    if created or approved:
-        lines.append("</blockquote>")
     return "\n".join(lines)
+
+
+def format_outage_quotes(items: list[dict[str, Any]], event_date: str) -> list[str]:
+    """Formats every planned outage as its own short Telegram quote."""
+    planned = [item for item in items if item.get("status") == 1 and item.get("shutdownHours")]
+    now = datetime.now(KYIV)
+    quotes = []
+    for item in planned:
+        hours = str(item["shutdownHours"])
+        state = "за графіком"
+        duration_text = ""
+        try:
+            start_value, end_value = hours.split("-", maxsplit=1)
+            start_time = datetime.strptime(start_value, "%H:%M").time()
+            end_time = datetime.strptime(end_value, "%H:%M").time()
+            start = datetime.combine(now.date(), start_time, KYIV)
+            end = datetime.combine(now.date(), end_time, KYIV)
+            if end <= start:
+                if event_date == now.strftime("%d.%m.%Y") and now < end:
+                    start -= timedelta(days=1)
+                else:
+                    end += timedelta(days=1)
+            duration_text = human_duration(int((end - start).total_seconds()))
+            if event_date == now.strftime("%d.%m.%Y"):
+                if now < start:
+                    state = "заплановано"
+                elif now < end:
+                    state = "триває"
+                else:
+                    state = "завершено"
+        except ValueError:
+            pass
+
+        display_hours = html.escape(hours.replace("-", "–"))
+        details = f" · {duration_text}" if duration_text else ""
+        quotes.append(f"<blockquote>⚡ <b>{display_hours}</b>{details} · {state}</blockquote>")
+    return quotes
 
 
 def human_duration(seconds: int) -> str:
