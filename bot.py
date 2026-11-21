@@ -10,7 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -73,6 +73,15 @@ def connect_db():
         "PRIMARY KEY (chat_id, queue))"
     )
     connection.execute(
+        "CREATE TABLE IF NOT EXISTS known_chats (chat_id INTEGER PRIMARY KEY, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)"
+    )
+    known_now = datetime.now(KYIV).isoformat(timespec="seconds")
+    connection.execute(
+        "INSERT OR IGNORE INTO known_chats(chat_id, first_seen, last_seen) "
+        "SELECT DISTINCT chat_id, ?, ? FROM subscriptions",
+        (known_now, known_now),
+    )
+    connection.execute(
         "CREATE TABLE IF NOT EXISTS schedules (queue TEXT NOT NULL, event_date TEXT NOT NULL, "
         "payload TEXT NOT NULL, fetched_at TEXT NOT NULL, PRIMARY KEY (queue, event_date))"
     )
@@ -82,6 +91,11 @@ def connect_db():
     )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS schedule_overrides (queue TEXT NOT NULL, event_date TEXT NOT NULL, "
+        "payload TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by INTEGER NOT NULL, "
+        "PRIMARY KEY (queue, event_date))"
     )
     connection.execute(
         "INSERT OR IGNORE INTO bot_settings(key, value) VALUES ('notifications_enabled', '1')"
@@ -123,10 +137,87 @@ def set_notifications_enabled(enabled: bool) -> None:
         db.commit()
 
 
+def get_schedule_override(queue: str, event_date: str) -> dict[str, Any] | None:
+    with connect_db() as db:
+        row = db.execute(
+            "SELECT payload FROM schedule_overrides WHERE queue = ? AND event_date = ?",
+            (queue, event_date),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["payload"])
+    except (TypeError, json.JSONDecodeError):
+        logger.exception("Не вдалося прочитати ручну зміну графіка: queue=%s date=%s", queue, event_date)
+        return None
+
+
+def save_schedule_override(queue: str, payload: dict[str, Any], admin_id: int) -> None:
+    event_date = payload["eventDate"]
+    now = datetime.now(KYIV).isoformat(timespec="seconds")
+    with connect_db() as db:
+        db.execute(
+            "INSERT INTO schedule_overrides(queue, event_date, payload, updated_at, updated_by) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(queue, event_date) DO UPDATE SET payload=excluded.payload, "
+            "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (queue, event_date, json.dumps(payload, ensure_ascii=False), now, admin_id),
+        )
+        db.commit()
+    logger.info("Адміністратор змінив графік у боті: user_id=%s queue=%s date=%s", admin_id, queue, event_date)
+
+
+def remove_schedule_override(queue: str, event_date: str, admin_id: int) -> None:
+    with connect_db() as db:
+        db.execute("DELETE FROM schedule_overrides WHERE queue = ? AND event_date = ?", (queue, event_date))
+        db.commit()
+    logger.info("Адміністратор скасував ручну зміну графіка: user_id=%s queue=%s date=%s", admin_id, queue, event_date)
+
+
+def known_chat_ids() -> list[int]:
+    with connect_db() as db:
+        rows = db.execute("SELECT chat_id FROM known_chats ORDER BY chat_id").fetchall()
+        return [row["chat_id"] for row in rows]
+
+
+class ChatTrackingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message):
+            now = datetime.now(KYIV).isoformat(timespec="seconds")
+            with connect_db() as db:
+                db.execute(
+                    "INSERT INTO known_chats(chat_id, first_seen, last_seen) VALUES (?, ?, ?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET last_seen=excluded.last_seen",
+                    (event.chat.id, now, now),
+                )
+        return await handler(event, data)
+
+
+def parse_manual_intervals(value: str) -> list[dict[str, Any]] | None:
+    if value.strip().lower() in {"немає", "нема", "0"}:
+        return []
+    intervals: list[dict[str, Any]] = []
+    for part in value.split(","):
+        try:
+            start_value, end_value = (piece.strip() for piece in part.split("-", maxsplit=1))
+            start = datetime.strptime(start_value, "%H:%M").strftime("%H:%M")
+            end = datetime.strptime(end_value, "%H:%M").strftime("%H:%M")
+        except (ValueError, TypeError):
+            return None
+        if start == end:
+            return None
+        intervals.append({"status": 1, "shutdownHours": f"{start}-{end}", "from": start, "to": end})
+        if len(intervals) > 12:
+            return None
+    intervals.sort(key=lambda item: item["from"])
+    return intervals or None
+
+
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Графіки", callback_data="admin:schedules"),
          InlineKeyboardButton(text="🔔 Сповіщення", callback_data="admin:notifications")],
+        [InlineKeyboardButton(text="📢 Оголошення всім", callback_data="admin:announcement"),
+         InlineKeyboardButton(text="✏️ Змінити графік", callback_data="admin:edit")],
         [InlineKeyboardButton(text="🔄 Оновити всі графіки", callback_data="admin:refresh:all")],
         [InlineKeyboardButton(text="📋 Останні логи", callback_data="admin:logs")],
     ])
@@ -135,6 +226,14 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
 def admin_queue_keyboard() -> InlineKeyboardMarkup:
     queues = sorted(VALID_QUEUES, key=lambda value: (int(value.split(".")[0]), int(value.split(".")[1])))
     rows = [[InlineKeyboardButton(text=queue, callback_data=f"admin:queue:{queue}")
+             for queue in queues[index:index + 3]] for index in range(0, len(queues), 3)]
+    rows.append([InlineKeyboardButton(text="⬅️ До меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_edit_queue_keyboard() -> InlineKeyboardMarkup:
+    queues = sorted(VALID_QUEUES, key=lambda value: (int(value.split(".")[0]), int(value.split(".")[1])))
+    rows = [[InlineKeyboardButton(text=queue, callback_data=f"admin:edit_queue:{queue}")
              for queue in queues[index:index + 3]] for index in range(0, len(queues), 3)]
     rows.append([InlineKeyboardButton(text="⬅️ До меню", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -384,6 +483,12 @@ def countdown_text(queue: str, payload: dict[str, Any]) -> str:
 
 
 async def fetch_schedule(session: aiohttp.ClientSession, queue: str) -> dict[str, Any] | None:
+    today_text = datetime.now(KYIV).strftime("%d.%m.%Y")
+    tomorrow_text = (datetime.now(KYIV) + timedelta(days=1)).strftime("%d.%m.%Y")
+    if override := get_schedule_override(queue, tomorrow_text):
+        return override
+    if override := get_schedule_override(queue, today_text):
+        return override
     try:
         async with session.get(API_URL.format(queue), timeout=TIMEOUT_SECONDS) as response:
             response.raise_for_status()
@@ -397,17 +502,23 @@ async def fetch_schedule(session: aiohttp.ClientSession, queue: str) -> dict[str
         dated = [(parse_date(item["eventDate"]).date(), item) for item in candidates]
         exact_tomorrow = [item for date, item in dated if date == tomorrow]
         if exact_tomorrow:
-            return exact_tomorrow[-1]
+            payload = exact_tomorrow[-1]
+            return get_schedule_override(queue, payload["eventDate"]) or payload
         future = [item for date, item in dated if date > tomorrow]
         if future:
-            return min(future, key=lambda item: parse_date(item["eventDate"]))
-        return max(candidates, key=lambda item: parse_date(item["eventDate"]))
+            payload = min(future, key=lambda item: parse_date(item["eventDate"]))
+            return get_schedule_override(queue, payload["eventDate"]) or payload
+        payload = max(candidates, key=lambda item: parse_date(item["eventDate"]))
+        return get_schedule_override(queue, payload["eventDate"]) or payload
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         logger.warning("Не вдалося отримати чергу %s: %s", queue, exc)
         return None
 
 
 async def fetch_today_schedule(session: aiohttp.ClientSession, queue: str) -> dict[str, Any] | None:
+    today_text = datetime.now(KYIV).strftime("%d.%m.%Y")
+    if override := get_schedule_override(queue, today_text):
+        return override
     try:
         async with session.get(API_URL.format(queue), timeout=TIMEOUT_SECONDS) as response:
             response.raise_for_status()
@@ -423,6 +534,9 @@ async def fetch_today_schedule(session: aiohttp.ClientSession, queue: str) -> di
 
 
 async def fetch_tomorrow_schedule(session: aiohttp.ClientSession, queue: str) -> dict[str, Any] | None:
+    tomorrow_text = (datetime.now(KYIV) + timedelta(days=1)).strftime("%d.%m.%Y")
+    if override := get_schedule_override(queue, tomorrow_text):
+        return override
     try:
         async with session.get(API_URL.format(queue), timeout=TIMEOUT_SECONDS) as response:
             response.raise_for_status()
@@ -585,7 +699,9 @@ async def main() -> None:
     connect_db().close()
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
+    dispatcher.message.middleware(ChatTrackingMiddleware())
     pending_action: dict[int, str] = {}
+    admin_pending_actions: dict[int, dict[str, Any]] = {}
     BOT_RUNNING = True
     logger.info("Telegram-бот запускається; черг моніторингу: %s", len(VALID_QUEUES))
 
@@ -601,6 +717,7 @@ async def main() -> None:
             logger.warning("Відмовлено в доступі до /admin: user_id=%s", user_id)
             await message.answer("⛔ Доступ до меню адміністратора закритий.")
             return
+        admin_pending_actions.pop(user_id, None)
         logger.info("Адміністратор відкрив меню: user_id=%s", user_id)
         await message.answer("⚙️ <b>Панель керування ботом</b>\nОберіть дію:", reply_markup=admin_main_keyboard())
 
@@ -617,7 +734,55 @@ async def main() -> None:
 
         data = callback.data or ""
         if data == "admin:menu":
+            admin_pending_actions.pop(user_id, None)
             await callback.message.edit_text("⚙️ <b>Панель керування ботом</b>\nОберіть дію:", reply_markup=admin_main_keyboard())
+            return
+        if data == "admin:cancel_input":
+            admin_pending_actions.pop(user_id, None)
+            await callback.message.edit_text("⚙️ <b>Панель керування ботом</b>\nДію скасовано.", reply_markup=admin_main_keyboard())
+            return
+        if data == "admin:announcement":
+            admin_pending_actions[user_id] = {"type": "announcement"}
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Скасувати", callback_data="admin:cancel_input")],
+            ])
+            await callback.message.edit_text(
+                "📢 <b>Оголошення всім користувачам бота</b>\n\nНадішліть наступним повідомленням текст. Його отримають усі чати, які вже писали боту.",
+                reply_markup=keyboard,
+            )
+            return
+        if data == "admin:edit":
+            admin_pending_actions.pop(user_id, None)
+            await callback.message.edit_text("✏️ <b>Зміна графіка в боті</b>\nОберіть чергу:", reply_markup=admin_edit_queue_keyboard())
+            return
+        if data.startswith("admin:edit_queue:"):
+            queue = normalize_queue(data.split(":", maxsplit=2)[2])
+            if not queue:
+                await callback.message.edit_text("Невідома черга.", reply_markup=admin_edit_queue_keyboard())
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Сьогодні", callback_data=f"admin:edit_date:today:{queue}"),
+                 InlineKeyboardButton(text="Завтра", callback_data=f"admin:edit_date:tomorrow:{queue}")],
+                [InlineKeyboardButton(text="⬅️ До черг", callback_data="admin:edit"),
+                 InlineKeyboardButton(text="🏠 Меню", callback_data="admin:menu")],
+            ])
+            await callback.message.edit_text(f"✏️ <b>Черга {queue}</b>\nНа який день змінити графік?", reply_markup=keyboard)
+            return
+        if data.startswith("admin:edit_date:"):
+            _, _, day_key, queue_value = data.split(":", maxsplit=3)
+            queue = normalize_queue(queue_value)
+            if not queue or day_key not in {"today", "tomorrow"}:
+                await callback.message.edit_text("Некоректна черга або дата.", reply_markup=admin_edit_queue_keyboard())
+                return
+            day_label = "сьогодні" if day_key == "today" else "завтра"
+            admin_pending_actions[user_id] = {"type": "edit_schedule", "queue": queue, "day": day_key}
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Скасувати", callback_data="admin:cancel_input")],
+            ])
+            await callback.message.edit_text(
+                f"✏️ <b>Новий графік · {queue} · {day_label}</b>\n\nНадішліть періоди через кому, наприклад:\n<code>12:00-15:30, 19:00-21:00</code>\n\nЩоб указати відсутність відключень, напишіть <code>немає</code>. Щоб повернути графік джерела, напишіть <code>офіційний</code>.",
+                reply_markup=keyboard,
+            )
             return
         if data == "admin:schedules":
             await callback.message.edit_text("📊 <b>Графіки</b>\nОберіть чергу:", reply_markup=admin_queue_keyboard())
@@ -705,7 +870,8 @@ async def main() -> None:
             "Привіт! Я стежу за графіками відключень.\n\n"
             "Користуйтеся кнопками внизу екрана. Також доступні команди "
             "<code>/subscribe 5.2</code>, <code>/unsubscribe 5.2</code>, "
-            "<code>/tomorrow 5.2</code> і <code>/subscriptions</code>.",
+            "<code>/tomorrow 5.2</code> і <code>/subscriptions</code>.\n"
+            "Для адміністратора: <code>/admin</code>; дізнатися свій ID: <code>/myid</code>.",
             reply_markup=main_keyboard(),
         )
 
@@ -835,8 +1001,121 @@ async def main() -> None:
         pending_action.pop(message.chat.id, None)
         await message.answer("Головне меню.", reply_markup=main_keyboard())
 
+    async def handle_admin_text(message: Message, user_id: int, state: dict[str, Any]) -> None:
+        text = (message.text or "").strip()
+        action_type = state.get("type")
+        if text.lower() in {"/cancel", "скасувати", "відміна"}:
+            admin_pending_actions.pop(user_id, None)
+            await message.answer("Дію скасовано.", reply_markup=admin_main_keyboard())
+            return
+
+        if action_type == "announcement":
+            if not text:
+                await message.answer("Надішліть текст оголошення або натисніть «Скасувати».")
+                return
+            if len(text) > 3500:
+                await message.answer("Оголошення задовге. Скоротіть його до 3500 символів.")
+                return
+            admin_pending_actions.pop(user_id, None)
+            recipients = known_chat_ids()
+            sent = 0
+            failed = 0
+            for chat_id in recipients:
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        f"📢 <b>Оголошення</b>\n\n<blockquote>{html.escape(text)}</blockquote>",
+                    )
+                    sent += 1
+                    if sent % 20 == 0:
+                        await asyncio.sleep(1)
+                except Exception as exc:
+                    failed += 1
+                    logger.warning("Не вдалося доставити оголошення: chat_id=%s error=%s", chat_id, exc)
+            logger.info("Масове оголошення завершено: admin_id=%s recipients=%s sent=%s failed=%s", user_id, len(recipients), sent, failed)
+            await message.answer(
+                f"📢 Розсилку завершено. Доставлено: <b>{sent}</b> із {len(recipients)} чатів; помилок: {failed}.",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
+
+        if action_type != "edit_schedule":
+            admin_pending_actions.pop(user_id, None)
+            await message.answer("Не вдалося визначити дію. Відкрийте /admin ще раз.", reply_markup=admin_main_keyboard())
+            return
+
+        queue = str(state["queue"])
+        day_key = str(state["day"])
+        now = datetime.now(KYIV)
+        event_date = (now + (timedelta(days=1) if day_key == "tomorrow" else timedelta())).strftime("%d.%m.%Y")
+        session: aiohttp.ClientSession
+        if text.lower() in {"офіційний", "скинути", "reset"}:
+            admin_pending_actions.pop(user_id, None)
+            remove_schedule_override(queue, event_date, user_id)
+            async with aiohttp.ClientSession() as session:
+                official = await (fetch_today_schedule(session, queue) if day_key == "today"
+                                 else fetch_tomorrow_schedule(session, queue))
+            sent = 0
+            if official:
+                save_and_check_changed(queue, official)
+                if notifications_enabled():
+                    for chat_id in subscribed_chats(queue):
+                        try:
+                            await bot.send_message(chat_id, format_schedule(queue, official, "Графік повернуто до джерела"))
+                            sent += 1
+                        except Exception as exc:
+                            logger.warning("Не вдалося повідомити про повернення графіка: chat_id=%s queue=%s error=%s", chat_id, queue, exc)
+            FORCE_REFRESH_EVENT.set()
+            if official:
+                await message.answer(
+                    f"✅ Ручну зміну скасовано. Отримано офіційний графік; повідомлено підписників: {sent}.",
+                    reply_markup=admin_main_keyboard(),
+                )
+            else:
+                await message.answer(
+                    "✅ Ручну зміну скасовано, але офіційний графік зараз недоступний. Бот підхопить його під час наступної перевірки.",
+                    reply_markup=admin_main_keyboard(),
+                )
+            return
+
+        intervals = parse_manual_intervals(text)
+        if intervals is None:
+            await message.answer(
+                "Не розпізнав періоди. Формат: <code>12:00-15:30, 19:00-21:00</code>, або напишіть <code>немає</code> чи <code>офіційний</code>.",
+            )
+            return
+
+        payload = {
+            "eventDate": event_date,
+            "createdAt": now.isoformat(timespec="minutes"),
+            "queues": {queue: intervals},
+        }
+        save_schedule_override(queue, payload, user_id)
+        save_and_check_changed(queue, payload)
+        recipients = subscribed_chats(queue)
+        sent = 0
+        if notifications_enabled():
+            for chat_id in recipients:
+                try:
+                    await bot.send_message(chat_id, format_schedule(queue, payload, "Графік змінено адміністратором"))
+                    sent += 1
+                except Exception as exc:
+                    logger.warning("Не вдалося надіслати змінений графік: chat_id=%s queue=%s error=%s", chat_id, queue, exc)
+        else:
+            logger.info("Графік змінено, розсилку пропущено через вимкнені сповіщення: queue=%s date=%s", queue, event_date)
+        FORCE_REFRESH_EVENT.set()
+        admin_pending_actions.pop(user_id, None)
+        await message.answer(
+            f"✅ Збережено ручний графік для черги <b>{queue}</b> на <b>{event_date}</b>. Відключень: {len(intervals)}. Повідомлено підписників: {sent} з {len(recipients)}.",
+            reply_markup=admin_main_keyboard(),
+        )
+
     @dispatcher.message(F.text)
     async def queue_choice(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if user_id is not None and user_id in admin_pending_actions and user_id in admin_user_ids():
+            await handle_admin_text(message, user_id, admin_pending_actions[user_id])
+            return
         action = pending_action.get(message.chat.id)
         queue = normalize_queue(message.text or "")
         if not action or not queue:
