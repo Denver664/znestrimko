@@ -173,6 +173,45 @@ def remove_schedule_override(queue: str, event_date: str, admin_id: int) -> None
     logger.info("Адміністратор скасував ручну зміну графіка: user_id=%s queue=%s date=%s", admin_id, queue, event_date)
 
 
+async def apply_manual_schedule(
+    telegram_bot: Bot,
+    queue: str,
+    event_date: str,
+    intervals: list[dict[str, Any]],
+    admin_id: int,
+    note: str = "",
+) -> tuple[int, int, bool]:
+    now = datetime.now(KYIV)
+    payload: dict[str, Any] = {
+        "eventDate": event_date,
+        "createdAt": now.isoformat(timespec="minutes"),
+        "queues": {queue: intervals},
+    }
+    if note:
+        payload["adminMessage"] = note
+    save_schedule_override(queue, payload, admin_id)
+    save_and_check_changed(queue, payload)
+    recipients = subscribed_chats(queue)
+    enabled = notifications_enabled()
+    sent = 0
+    if enabled:
+        text = format_schedule(queue, payload, "Графік змінено адміністратором")
+        for chat_id in recipients:
+            try:
+                await telegram_bot.send_message(chat_id, text)
+                sent += 1
+            except Exception as exc:
+                logger.warning("Не вдалося надіслати змінений графік: chat_id=%s queue=%s error=%s", chat_id, queue, exc)
+    else:
+        logger.info("Графік змінено, розсилку пропущено через вимкнені сповіщення: queue=%s date=%s", queue, event_date)
+    FORCE_REFRESH_EVENT.set()
+    logger.info(
+        "Ручний графік розіслано: queue=%s date=%s intervals=%s recipients=%s sent=%s note=%s",
+        queue, event_date, len(intervals), len(recipients), sent, bool(note),
+    )
+    return sent, len(recipients), enabled
+
+
 def known_chat_ids() -> list[int]:
     with connect_db() as db:
         rows = db.execute("SELECT chat_id FROM known_chats ORDER BY chat_id").fetchall()
@@ -328,6 +367,9 @@ def format_schedule(queue: str, payload: dict[str, Any], title: str = "Граф�
         lines.extend(["", f"🔄 Оновлено: {html.escape(str(created))}"])
     if approved:
         lines.append(f"✅ Затверджено з: {html.escape(str(approved))}")
+    admin_message = payload.get("adminMessage")
+    if admin_message:
+        lines.extend(["", "📢 <b>Повідомлення адміністратора</b>", html.escape(str(admin_message))])
     return "\n".join(lines)
 
 
@@ -755,6 +797,24 @@ async def main() -> None:
             admin_pending_actions.pop(user_id, None)
             await callback.message.edit_text("✏️ <b>Зміна графіка в боті</b>\nОберіть чергу:", reply_markup=admin_edit_queue_keyboard())
             return
+        if data == "admin:edit_skip_note":
+            state = admin_pending_actions.get(user_id, {})
+            if state.get("type") != "edit_schedule_note":
+                await callback.message.edit_text("Дія завершилася. Відкрийте /admin ще раз.", reply_markup=admin_main_keyboard())
+                return
+            admin_pending_actions.pop(user_id, None)
+            queue = str(state["queue"])
+            day_key = str(state["day"])
+            event_date = (datetime.now(KYIV) + (timedelta(days=1) if day_key == "tomorrow" else timedelta())).strftime("%d.%m.%Y")
+            sent, recipients, enabled = await apply_manual_schedule(
+                bot, queue, event_date, state["intervals"], user_id,
+            )
+            notice = f"Повідомлено підписників: {sent} з {recipients}." if enabled else "Сповіщення вимкнені, розсилки не було."
+            await callback.message.edit_text(
+                f"✅ Графік для черги <b>{queue}</b> на <b>{event_date}</b> збережено без додаткового повідомлення. {notice}",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
         if data.startswith("admin:edit_queue:"):
             queue = normalize_queue(data.split(":", maxsplit=2)[2])
             if not queue:
@@ -1039,6 +1099,27 @@ async def main() -> None:
             )
             return
 
+        if action_type == "edit_schedule_note":
+            if not text:
+                await message.answer("Надішліть текст повідомлення або натисніть «Без повідомлення».")
+                return
+            if len(text) > 1500:
+                await message.answer("Повідомлення задовге. Скоротіть його до 1500 символів або пропустіть.")
+                return
+            queue = str(state["queue"])
+            day_key = str(state["day"])
+            event_date = (datetime.now(KYIV) + (timedelta(days=1) if day_key == "tomorrow" else timedelta())).strftime("%d.%m.%Y")
+            sent, recipients, enabled = await apply_manual_schedule(
+                bot, queue, event_date, state["intervals"], user_id, note=text,
+            )
+            admin_pending_actions.pop(user_id, None)
+            delivery = f"Повідомлено підписників: {sent} з {recipients}." if enabled else "Сповіщення вимкнені — розсилки не було."
+            await message.answer(
+                f"✅ Графік для черги <b>{queue}</b> на <b>{event_date}</b> збережено разом із повідомленням. {delivery}",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
+
         if action_type != "edit_schedule":
             admin_pending_actions.pop(user_id, None)
             await message.answer("Не вдалося визначити дію. Відкрийте /admin ще раз.", reply_markup=admin_main_keyboard())
@@ -1048,7 +1129,6 @@ async def main() -> None:
         day_key = str(state["day"])
         now = datetime.now(KYIV)
         event_date = (now + (timedelta(days=1) if day_key == "tomorrow" else timedelta())).strftime("%d.%m.%Y")
-        session: aiohttp.ClientSession
         if text.lower() in {"офіційний", "скинути", "reset"}:
             admin_pending_actions.pop(user_id, None)
             remove_schedule_override(queue, event_date, user_id)
@@ -1084,30 +1164,16 @@ async def main() -> None:
                 "Не розпізнав періоди. Формат: <code>12:00-15:30, 19:00-21:00</code>, або напишіть <code>немає</code> чи <code>офіційний</code>.",
             )
             return
-
-        payload = {
-            "eventDate": event_date,
-            "createdAt": now.isoformat(timespec="minutes"),
-            "queues": {queue: intervals},
+        admin_pending_actions[user_id] = {
+            "type": "edit_schedule_note", "queue": queue, "day": day_key, "intervals": intervals,
         }
-        save_schedule_override(queue, payload, user_id)
-        save_and_check_changed(queue, payload)
-        recipients = subscribed_chats(queue)
-        sent = 0
-        if notifications_enabled():
-            for chat_id in recipients:
-                try:
-                    await bot.send_message(chat_id, format_schedule(queue, payload, "Графік змінено адміністратором"))
-                    sent += 1
-                except Exception as exc:
-                    logger.warning("Не вдалося надіслати змінений графік: chat_id=%s queue=%s error=%s", chat_id, queue, exc)
-        else:
-            logger.info("Графік змінено, розсилку пропущено через вимкнені сповіщення: queue=%s date=%s", queue, event_date)
-        FORCE_REFRESH_EVENT.set()
-        admin_pending_actions.pop(user_id, None)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Без повідомлення", callback_data="admin:edit_skip_note")],
+            [InlineKeyboardButton(text="Скасувати", callback_data="admin:cancel_input")],
+        ])
         await message.answer(
-            f"✅ Збережено ручний графік для черги <b>{queue}</b> на <b>{event_date}</b>. Відключень: {len(intervals)}. Повідомлено підписників: {sent} з {len(recipients)}.",
-            reply_markup=admin_main_keyboard(),
+            f"✅ Періоди прийнято. Тепер надішліть коротке повідомлення, яке додати до графіка <b>{queue}</b> на <b>{event_date}</b>, або пропустіть цей крок.",
+            reply_markup=keyboard,
         )
 
     @dispatcher.message(F.text)
