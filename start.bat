@@ -17,11 +17,10 @@ if not exist ".env" (
 )
 
 call ".venv\Scripts\activate.bat"
-echo Starting Znestrumko bot and admin panel...
-echo Admin panel: http://localhost:8080
+echo Starting Znestrumko bot...
 echo Press Ctrl+C to stop the bot.
 echo.
-python web_admin.py
+python bot.py
 
 echo.
 echo Bot stopped.

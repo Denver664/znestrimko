@@ -2,4 +2,3 @@
 bot.sqlite3
 __pycache__/
 .venv/
-admin_token.txt

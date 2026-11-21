@@ -1,7 +1,9 @@
 import asyncio
+import html
 import json
 import logging
 import os
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,14 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 try:
     from dotenv import load_dotenv
@@ -40,6 +49,17 @@ LAST_SUCCESS_AT: str | None = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
+ADMIN_LOGS: deque[str] = deque(maxlen=250)
+
+
+class AdminLogBuffer(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        ADMIN_LOGS.append(self.format(record))
+
+
+admin_log_handler = AdminLogBuffer(logging.INFO)
+admin_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s — %(message)s", "%H:%M:%S"))
+logging.getLogger().addHandler(admin_log_handler)
 
 
 def connect_db():
@@ -60,6 +80,12 @@ def connect_db():
         "CREATE TABLE IF NOT EXISTS sent_reminders (chat_id INTEGER NOT NULL, queue TEXT NOT NULL, "
         "event_date TEXT NOT NULL, shutdown_hours TEXT NOT NULL, PRIMARY KEY (chat_id, queue, event_date, shutdown_hours))"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO bot_settings(key, value) VALUES ('notifications_enabled', '1')"
+    )
     connection.commit()
     return connection
 
@@ -69,6 +95,65 @@ def normalize_queue(value: str) -> str | None:
     if "." not in value:
         value = f"{value}.1"
     return value if value in VALID_QUEUES else None
+
+
+def admin_user_ids() -> set[int]:
+    ids: set[int] = set()
+    for value in os.getenv("ADMIN_USER_IDS", "").split(","):
+        try:
+            ids.add(int(value.strip()))
+        except ValueError:
+            continue
+    return ids
+
+
+def notifications_enabled() -> bool:
+    with connect_db() as db:
+        row = db.execute("SELECT value FROM bot_settings WHERE key = 'notifications_enabled'").fetchone()
+        return not row or row["value"] == "1"
+
+
+def set_notifications_enabled(enabled: bool) -> None:
+    with connect_db() as db:
+        db.execute(
+            "INSERT INTO bot_settings(key, value) VALUES ('notifications_enabled', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("1" if enabled else "0",),
+        )
+        db.commit()
+
+
+def admin_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Графіки", callback_data="admin:schedules"),
+         InlineKeyboardButton(text="🔔 Сповіщення", callback_data="admin:notifications")],
+        [InlineKeyboardButton(text="🔄 Оновити всі графіки", callback_data="admin:refresh:all")],
+        [InlineKeyboardButton(text="📋 Останні логи", callback_data="admin:logs")],
+    ])
+
+
+def admin_queue_keyboard() -> InlineKeyboardMarkup:
+    queues = sorted(VALID_QUEUES, key=lambda value: (int(value.split(".")[0]), int(value.split(".")[1])))
+    rows = [[InlineKeyboardButton(text=queue, callback_data=f"admin:queue:{queue}")
+             for queue in queues[index:index + 3]] for index in range(0, len(queues), 3)]
+    rows.append([InlineKeyboardButton(text="⬅️ До меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_queue_detail_keyboard(queue: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 На завтра", callback_data=f"admin:tomorrow:{queue}"),
+         InlineKeyboardButton(text="🔄 Оновити", callback_data=f"admin:refresh:{queue}")],
+        [InlineKeyboardButton(text="⬅️ До черг", callback_data="admin:schedules"),
+         InlineKeyboardButton(text="🏠 Меню", callback_data="admin:menu")],
+    ])
+
+
+def admin_log_text() -> str:
+    lines = [html.escape(line[:240]) for line in list(ADMIN_LOGS)[-14:]]
+    if not lines:
+        lines = ["Поки що немає подій у журналі."]
+    return "📋 <b>Останні події бота</b>\n<blockquote>" + "\n".join(lines) + "</blockquote>"
 
 
 def parse_date(value: str) -> datetime:
@@ -125,18 +210,24 @@ def format_schedule(queue: str, payload: dict[str, Any], title: str = "Граф�
     lines = [
         f"⚡ <b>{title}</b>",
         "",
-        f"🗓 Дата: <b>{event_date}</b>",
-        f"🚦 Черга: <b>{queue}</b>",
-        f"📌 Статус: <b>{status}</b>",
-        f"⏰ Час: <b>{interval_text}</b>",
+        "<blockquote>",
+        f"🗓 Дата: <b>{html.escape(str(event_date))}</b>",
+        f"🚦 Черга: <b>{html.escape(queue)}</b>",
+        f"📌 Статус: <b>{html.escape(status)}</b>",
+        f"⏰ Час: <b>{html.escape(interval_text)}</b>",
         f"📊 Загалом без світла за графіком: <b>{human_duration(scheduled_blackout_seconds(intervals))}</b>",
+        "</blockquote>",
     ]
     created = payload.get("createdAt")
     approved = payload.get("scheduleApprovedSince")
     if created:
-        lines.extend(["", f"🔄 Оновлено: {created}"])
+        lines.extend(["", "<blockquote expandable>", f"🔄 Оновлено: {html.escape(str(created))}"])
     if approved:
-        lines.append(f"✅ Затверджено з: {approved}")
+        if not created:
+            lines.extend(["", "<blockquote expandable>"])
+        lines.append(f"✅ Затверджено з: {html.escape(str(approved))}")
+    if created or approved:
+        lines.append("</blockquote>")
     return "\n".join(lines)
 
 
@@ -180,6 +271,8 @@ def claim_reminder(chat_id: int, queue: str, event_date: str, hours: str) -> boo
 
 
 async def send_upcoming_reminders(bot: Bot, queue: str, payload: dict[str, Any]) -> None:
+    if not notifications_enabled():
+        return
     event_date = payload.get("eventDate", "")
     if event_date != datetime.now(KYIV).strftime("%d.%m.%Y"):
         return
@@ -458,6 +551,116 @@ async def main() -> None:
     BOT_RUNNING = True
     logger.info("Telegram-бот запускається; черг моніторингу: %s", len(VALID_QUEUES))
 
+    @dispatcher.message(Command("myid"))
+    async def my_id(message: Message) -> None:
+        if message.from_user:
+            await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
+    @dispatcher.message(Command("admin"))
+    async def admin_command(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if user_id not in admin_user_ids():
+            logger.warning("Відмовлено в доступі до /admin: user_id=%s", user_id)
+            await message.answer("⛔ Доступ до меню адміністратора закритий.")
+            return
+        logger.info("Адміністратор відкрив меню: user_id=%s", user_id)
+        await message.answer("⚙️ <b>Панель керування ботом</b>\nОберіть дію:", reply_markup=admin_main_keyboard())
+
+    @dispatcher.callback_query(F.data.startswith("admin:"))
+    async def admin_callback(callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id if callback.from_user else None
+        if user_id not in admin_user_ids():
+            logger.warning("Відмовлено в callback адмінки: user_id=%s", user_id)
+            await callback.answer("⛔ Немає доступу", show_alert=True)
+            return
+        await callback.answer()
+        if not callback.message:
+            return
+
+        data = callback.data or ""
+        if data == "admin:menu":
+            await callback.message.edit_text("⚙️ <b>Панель керування ботом</b>\nОберіть дію:", reply_markup=admin_main_keyboard())
+            return
+        if data == "admin:schedules":
+            await callback.message.edit_text("📊 <b>Графіки</b>\nОберіть чергу:", reply_markup=admin_queue_keyboard())
+            return
+        if data.startswith("admin:queue:"):
+            queue = normalize_queue(data.split(":", maxsplit=2)[2])
+            if not queue:
+                await callback.message.edit_text("Невідома черга.", reply_markup=admin_queue_keyboard())
+                return
+            async with aiohttp.ClientSession() as session:
+                payload = await fetch_today_schedule(session, queue)
+            logger.info("Адміністратор переглянув графік: user_id=%s queue=%s", user_id, queue)
+            text = format_schedule(queue, payload, "Графік на сьогодні") if payload else (
+                f"📊 <b>Черга {queue}</b>\n\nНа сьогодні графік ще не опублікований."
+            )
+            await callback.message.edit_text(text, reply_markup=admin_queue_detail_keyboard(queue))
+            return
+        if data.startswith("admin:tomorrow:"):
+            queue = normalize_queue(data.split(":", maxsplit=2)[2])
+            if not queue:
+                await callback.message.edit_text("Невідома черга.", reply_markup=admin_queue_keyboard())
+                return
+            async with aiohttp.ClientSession() as session:
+                payload = await fetch_tomorrow_schedule(session, queue)
+            text = format_schedule(queue, payload, "Графік на завтра") if payload else (
+                f"📅 <b>Черга {queue}</b>\n\nГрафіку на завтра ще немає."
+            )
+            await callback.message.edit_text(text, reply_markup=admin_queue_detail_keyboard(queue))
+            return
+        if data.startswith("admin:refresh:"):
+            requested = data.split(":", maxsplit=2)[2]
+            queue = "*" if requested == "all" else normalize_queue(requested)
+            if not queue:
+                await callback.message.edit_text("Невідома черга.", reply_markup=admin_main_keyboard())
+                return
+            FORCE_REFRESH_REQUESTS.put_nowait(queue)
+            FORCE_REFRESH_EVENT.set()
+            logger.info("Адміністратор запросив примусове оновлення: user_id=%s queue=%s", user_id, "усі" if queue == "*" else queue)
+            label = "усіх черг" if queue == "*" else f"черги {queue}"
+            delivery = "Графік буде надіслано підписникам." if notifications_enabled() else "Сповіщення вимкнені — графік оновиться без розсилки."
+            await callback.message.edit_text(
+                f"🔄 Примусове оновлення {label} поставлено в чергу. Результат з’явиться в логах. {delivery}",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
+        if data == "admin:notifications":
+            enabled = notifications_enabled()
+            button = InlineKeyboardButton(
+                text="🔕 Вимкнути сповіщення" if enabled else "🔔 Увімкнути сповіщення",
+                callback_data="admin:notifications:toggle",
+            )
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [button], [InlineKeyboardButton(text="⬅️ До меню", callback_data="admin:menu")],
+            ])
+            state = "увімкнені" if enabled else "вимкнені"
+            await callback.message.edit_text(
+                f"🔔 <b>Сповіщення {state}</b>\n\nКерування впливає на нагадування за 10 хвилин і повідомлення про зміну графіка для підписників.",
+                reply_markup=keyboard,
+            )
+            return
+        if data == "admin:notifications:toggle":
+            enabled = not notifications_enabled()
+            set_notifications_enabled(enabled)
+            logger.info("Адміністратор %s сповіщення: enabled=%s", "увімкнув" if enabled else "вимкнув", enabled)
+            state = "увімкнені" if enabled else "вимкнені"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔕 Вимкнути" if enabled else "🔔 Увімкнути", callback_data="admin:notifications:toggle")],
+                [InlineKeyboardButton(text="⬅️ До меню", callback_data="admin:menu")],
+            ])
+            await callback.message.edit_text(f"🔔 <b>Сповіщення {state}</b>", reply_markup=keyboard)
+            return
+        if data in {"admin:logs", "admin:logs:refresh"}:
+            logger.info("Адміністратор переглянув журнал: user_id=%s", user_id)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↻ Оновити журнал", callback_data="admin:logs:refresh")],
+                [InlineKeyboardButton(text="⬅️ До меню", callback_data="admin:menu")],
+            ])
+            await callback.message.edit_text(admin_log_text(), reply_markup=keyboard)
+            return
+        await callback.message.edit_text("Невідома дія.", reply_markup=admin_main_keyboard())
+
     @dispatcher.message(CommandStart())
     async def start(message: Message) -> None:
         await message.answer(
@@ -658,6 +861,9 @@ async def main() -> None:
                                 continue
                             changed = save_and_check_changed(queue, payload)
                             if forced or changed:
+                                if not notifications_enabled():
+                                    logger.info("Розсилку пропущено: сповіщення вимкнені, queue=%s date=%s forced=%s", queue, payload.get("eventDate"), forced)
+                                    continue
                                 if forced:
                                     title = "Графік примусово оновлено"
                                 text = format_schedule(queue, payload, title)
